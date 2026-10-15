@@ -179,6 +179,13 @@ using google::protobuf::RepeatedPtrField;
 // is marked superseded (and stops at its next cancellation point), and the new heartbeat waits as
 // the pending one, replacing (and dropping) any heartbeat that was already pending. Whichever
 // thread finishes the running heartbeat processes the pending one, so no thread blocks waiting.
+//
+// Slots are keyed by permanent UUID so that heartbeats from a restarted tserver process are
+// serialized with those of the previous process. A heartbeat whose instance seqno is lower than
+// that of the newest admitted heartbeat is rejected rather than allowed to supersede it: otherwise
+// two live processes sharing a UUID would keep superseding each other's heartbeats. This trusts
+// instance seqnos (process start times) to increase across restarts no more than registration
+// already does, which rejects a lower seqno.
 class TServerHeartbeatSlots {
  public:
   struct Heartbeat {
@@ -196,20 +203,32 @@ class TServerHeartbeatSlots {
   // Returns the heartbeat if the caller should process it now. Otherwise the heartbeat is pending
   // and will be returned from Finish to whichever thread is processing this tserver's heartbeats.
   std::optional<Admitted> Admit(const TabletServerId& ts_uuid, Heartbeat heartbeat) {
+    const auto seqno = heartbeat.req->common().ts_instance().instance_seqno();
     std::optional<Heartbeat> dropped;
+    Status drop_status;
     {
       std::lock_guard lock(mutex_);
       auto& slot = slots_[ts_uuid];
       if (!slot.running) {
         slot.running = true;
         slot.superseded = false;
+        slot.newest_seqno = seqno;
         return Admitted{std::move(heartbeat), &slot.superseded};
       }
-      slot.superseded = true;
-      dropped = std::exchange(slot.pending, std::move(heartbeat));
+      if (seqno < slot.newest_seqno) {
+        drop_status = STATUS_FORMAT(
+            IllegalState, "Heartbeat from instance seqno $0 is older than in-flight heartbeat from "
+            "instance seqno $1", seqno, slot.newest_seqno);
+        dropped = std::move(heartbeat);
+      } else {
+        slot.newest_seqno = seqno;
+        slot.superseded = true;
+        drop_status = STATUS(Aborted, kSupersededMessage);
+        dropped = std::exchange(slot.pending, std::move(heartbeat));
+      }
     }
     if (dropped) {
-      dropped->rpc.RespondFailure(STATUS(Aborted, kSupersededMessage));
+      dropped->rpc.RespondFailure(drop_status);
     }
     return std::nullopt;
   }
@@ -234,6 +253,8 @@ class TServerHeartbeatSlots {
  private:
   struct Slot {
     bool running = false;
+    // Instance seqno of the newest heartbeat admitted (running or pending).
+    int64_t newest_seqno = 0;
     std::atomic<bool> superseded{false};
     std::optional<Heartbeat> pending;
   };

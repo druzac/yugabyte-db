@@ -145,6 +145,17 @@ class MasterTest : public MasterTestBase {
   Result<TSHeartbeatResponsePB> SendNewTSRegistrationHeartbeat(
       const std::string& uuid, int64_t instance_seqno);
 
+  // Sends a heartbeat for an already-registered ts. Unlike SendHeartbeat, safe to call
+  // concurrently.
+  Status SendConcurrentHeartbeat(const std::string& uuid, int64_t instance_seqno);
+
+  std::future<Status> SendConcurrentHeartbeatAsync(
+      const std::string& uuid, int64_t instance_seqno) {
+    return std::async(std::launch::async, [this, uuid, instance_seqno] {
+      return SendConcurrentHeartbeat(uuid, instance_seqno);
+    });
+  }
+
   // Sends a heartbeat carrying the given per-db local compaction pins for an already-registered ts.
   Result<TSHeartbeatResponsePB> SendYsqlDbOldestPinnedReadTimesHeartbeat(
       const std::string& uuid, int64_t instance_seqno,
@@ -212,36 +223,16 @@ TEST_F(MasterTest, TestHeartbeatRequestWithEmptyUUID) {
 TEST_F(MasterTest, TestNewerHeartbeatSupersedesInFlightHeartbeats) {
   ASSERT_RESULT(SendNewTSRegistrationHeartbeat("ts-1", 1));
   ASSERT_RESULT(SendNewTSRegistrationHeartbeat("ts-2", 1));
-  auto universe_uuid =
-      ASSERT_RESULT(mini_master_->catalog_manager().GetClusterConfig()).universe_uuid();
-
-  auto send_heartbeat = [this, &universe_uuid](const std::string& uuid) {
-    TSHeartbeatRequestPB req;
-    TSHeartbeatResponsePB resp;
-    req.mutable_common()->mutable_ts_instance()->set_permanent_uuid(uuid);
-    req.mutable_common()->mutable_ts_instance()->set_instance_seqno(1);
-    req.set_universe_uuid(universe_uuid);
-    rpc::RpcController controller;
-    controller.set_timeout(MonoDelta::FromSeconds(30));
-    auto status = proxy_heartbeat_->TSHeartbeat(req, &resp, &controller);
-    if (status.ok() && resp.has_error()) {
-      status = StatusFromPB(resp.error().status());
-    }
-    return status;
-  };
-  auto send_async = [&send_heartbeat](const std::string& uuid) {
-    return std::async(std::launch::async, send_heartbeat, uuid);
-  };
 
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_ts_heartbeat_processing_delay_ms) = 5000;
-  auto first = send_async("ts-1");
+  auto first = SendConcurrentHeartbeatAsync("ts-1", 1);
   SleepFor(500ms);
-  auto other_ts = send_async("ts-2");
+  auto other_ts = SendConcurrentHeartbeatAsync("ts-2", 1);
   // Supersedes the first heartbeat, then is itself superseded by the third, whether it is still
   // pending or already running when the third arrives.
-  auto second = send_async("ts-1");
+  auto second = SendConcurrentHeartbeatAsync("ts-1", 1);
   SleepFor(500ms);
-  auto third = send_async("ts-1");
+  auto third = SendConcurrentHeartbeatAsync("ts-1", 1);
 
   // The first heartbeat stops well before its 5s delay elapses.
   ASSERT_EQ(first.wait_for(2s), std::future_status::ready);
@@ -251,6 +242,18 @@ TEST_F(MasterTest, TestNewerHeartbeatSupersedesInFlightHeartbeats) {
   ASSERT_STR_CONTAINS(second_status.ToString(), "Superseded");
   ASSERT_OK(third.get());
   ASSERT_OK(other_ts.get());
+}
+
+TEST_F(MasterTest, TestHeartbeatFromOlderInstanceDoesNotSupersede) {
+  ASSERT_RESULT(SendNewTSRegistrationHeartbeat("ts-1", 2));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_ts_heartbeat_processing_delay_ms) = 3000;
+  auto current = SendConcurrentHeartbeatAsync("ts-1", 2);
+  SleepFor(500ms);
+  auto stale_status = SendConcurrentHeartbeat("ts-1", 1);
+  ASSERT_STR_CONTAINS(stale_status.ToString(), "older than in-flight heartbeat");
+  ASSERT_EQ(current.wait_for(0s), std::future_status::timeout);
+  ASSERT_OK(current.get());
 }
 
 class MasterTestSkipUniverseUuidCheck : public MasterTest {
@@ -3264,6 +3267,23 @@ Result<TSHeartbeatResponsePB> MasterTest::SendNewTSRegistrationHeartbeat(
     registered_ts_count_++;
   }
   return result;
+}
+
+Status MasterTest::SendConcurrentHeartbeat(const std::string& uuid, int64_t instance_seqno) {
+  SysClusterConfigEntryPB config =
+      VERIFY_RESULT(mini_master_->catalog_manager().GetClusterConfig());
+  TSHeartbeatRequestPB req;
+  TSHeartbeatResponsePB resp;
+  req.mutable_common()->mutable_ts_instance()->set_permanent_uuid(uuid);
+  req.mutable_common()->mutable_ts_instance()->set_instance_seqno(instance_seqno);
+  req.set_universe_uuid(config.universe_uuid());
+  rpc::RpcController controller;
+  controller.set_timeout(MonoDelta::FromSeconds(30));
+  RETURN_NOT_OK(proxy_heartbeat_->TSHeartbeat(req, &resp, &controller));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  return Status::OK();
 }
 
 Result<TSHeartbeatResponsePB> MasterTest::SendYsqlDbOldestPinnedReadTimesHeartbeat(
