@@ -12,7 +12,11 @@
 //
 
 #include <algorithm>
+#include <atomic>
 #include <iterator>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
 
 #include <google/protobuf/repeated_field.h>
 
@@ -135,6 +139,10 @@ TAG_FLAG(send_leader_blacklisted_tservers_on_heartbeat, advanced);
 DEFINE_test_flag(uint64, inject_latency_during_tablet_report_ms, 0,
                  "Number of milliseconds to sleep during the processing of a tablet batch.");
 
+DEFINE_test_flag(uint64, ts_heartbeat_processing_delay_ms, 0,
+    "Number of milliseconds to sleep at the start of TSHeartbeat processing, or until the "
+    "heartbeat is superseded by a newer one from the same tserver.");
+
 DEFINE_test_flag(bool, simulate_sys_catalog_data_loss, false,
     "On the heartbeat processing path, simulate a scenario where tablet metadata is missing due to "
     "a corruption. ");
@@ -163,6 +171,79 @@ using tablet::TABLET_DATA_TOMBSTONED;
 
 using google::protobuf::RepeatedPtrField;
 
+// Admits at most one TSHeartbeat per tserver into processing, and only the newest one.
+//
+// A tserver sends heartbeats sequentially, and sends the next one only after it has received the
+// previous response or given up on it. So when a newer heartbeat arrives while an older one is
+// still being processed, the tserver is no longer waiting for the older one: the running heartbeat
+// is marked superseded (and stops at its next cancellation point), and the new heartbeat waits as
+// the pending one, replacing (and dropping) any heartbeat that was already pending. Whichever
+// thread finishes the running heartbeat processes the pending one, so no thread blocks waiting.
+class TServerHeartbeatSlots {
+ public:
+  struct Heartbeat {
+    const TSHeartbeatRequestPB* req;
+    TSHeartbeatResponsePB* resp;
+    rpc::RpcContext rpc;
+  };
+
+  struct Admitted {
+    Heartbeat heartbeat;
+    // Set once a newer heartbeat from the same tserver arrives. Valid until the matching Finish.
+    const std::atomic<bool>* superseded;
+  };
+
+  // Returns the heartbeat if the caller should process it now. Otherwise the heartbeat is pending
+  // and will be returned from Finish to whichever thread is processing this tserver's heartbeats.
+  std::optional<Admitted> Admit(const TabletServerId& ts_uuid, Heartbeat heartbeat) {
+    std::optional<Heartbeat> dropped;
+    {
+      std::lock_guard lock(mutex_);
+      auto& slot = slots_[ts_uuid];
+      if (!slot.running) {
+        slot.running = true;
+        slot.superseded = false;
+        return Admitted{std::move(heartbeat), &slot.superseded};
+      }
+      slot.superseded = true;
+      dropped = std::exchange(slot.pending, std::move(heartbeat));
+    }
+    if (dropped) {
+      dropped->rpc.RespondFailure(STATUS(Aborted, kSupersededMessage));
+    }
+    return std::nullopt;
+  }
+
+  // Called when processing of an admitted heartbeat has finished. Returns the pending heartbeat,
+  // which the caller must process next, if there is one.
+  std::optional<Admitted> Finish(const TabletServerId& ts_uuid) {
+    std::lock_guard lock(mutex_);
+    auto it = slots_.find(ts_uuid);
+    auto& slot = it->second;
+    if (!slot.pending) {
+      slots_.erase(it);
+      return std::nullopt;
+    }
+    slot.superseded = false;
+    return Admitted{*std::exchange(slot.pending, std::nullopt), &slot.superseded};
+  }
+
+  static constexpr const char* kSupersededMessage =
+      "Superseded by a newer heartbeat from the same tserver";
+
+ private:
+  struct Slot {
+    bool running = false;
+    std::atomic<bool> superseded{false};
+    std::optional<Heartbeat> pending;
+  };
+
+  std::mutex mutex_;
+  // A slot exists only while one of its tserver's heartbeats is being processed. Slots are not
+  // moved by inserts or erases of other keys, so Admitted::superseded stays valid.
+  std::unordered_map<TabletServerId, Slot> slots_ GUARDED_BY(mutex_);
+};
+
 class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartbeatIf {
  public:
   explicit MasterHeartbeatServiceImpl(Master* master)
@@ -178,8 +259,13 @@ class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartb
                    rpc::RpcContext rpc) override;
 
  private:
+  void ProcessTSHeartbeat(
+      const TSHeartbeatRequestPB* req, TSHeartbeatResponsePB* resp, rpc::RpcContext rpc,
+      const std::atomic<bool>& superseded);
+
   Master* master_;
   CatalogManager* catalog_manager_;
+  TServerHeartbeatSlots heartbeat_slots_;
 
   struct ReportedTablet {
     TabletId tablet_id;
@@ -201,7 +287,8 @@ class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartb
       const TabletReportPB* report_ptr,
       const LeaderEpoch& epoch,
       TabletReportUpdatesPB* report_update,
-      rpc::RpcContext* rpc);
+      rpc::RpcContext* rpc,
+      const std::atomic<bool>& superseded);
 
   Status ProcessTabletReportBatch(
       const TSDescriptorPtr& ts_desc,
@@ -438,8 +525,36 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
     const TSHeartbeatRequestPB* req,
     TSHeartbeatResponsePB* resp,
     rpc::RpcContext rpc) {
+  // A copy: the request is freed once its response is sent, before the Finish call below.
+  const TabletServerId ts_uuid = req->common().ts_instance().permanent_uuid();
+  if (ts_uuid.empty()) {
+    // Rejected by ProcessTSHeartbeat.
+    static const std::atomic<bool> kNotSuperseded{false};
+    ProcessTSHeartbeat(req, resp, std::move(rpc), kNotSuperseded);
+    return;
+  }
+  for (auto next = heartbeat_slots_.Admit(ts_uuid, {req, resp, std::move(rpc)}); next;
+       next = heartbeat_slots_.Finish(ts_uuid)) {
+    auto& hb = next->heartbeat;
+    ProcessTSHeartbeat(hb.req, hb.resp, std::move(hb.rpc), *next->superseded);
+  }
+}
+
+void MasterHeartbeatServiceImpl::ProcessTSHeartbeat(
+    const TSHeartbeatRequestPB* req, TSHeartbeatResponsePB* resp, rpc::RpcContext rpc,
+    const std::atomic<bool>& superseded) {
   LongOperationTracker long_operation_tracker(
       "TSHeartbeat", FLAGS_master_ts_heartbeat_long_operation_warning_ms * 1ms);
+
+  for (auto delay_end = CoarseMonoClock::Now() + MonoDelta::FromMilliseconds(
+           ANNOTATE_UNPROTECTED_READ(FLAGS_TEST_ts_heartbeat_processing_delay_ms));
+       CoarseMonoClock::Now() < delay_end;) {
+    if (superseded.load()) {
+      rpc.RespondFailure(STATUS(Aborted, TServerHeartbeatSlots::kSupersededMessage));
+      return;
+    }
+    SleepFor(10ms);
+  }
 
   consensus::ConsensusStatePB cpb;
   Status s = catalog_manager_->GetCurrentConfig(&cpb);
@@ -516,7 +631,7 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
         ts_desc, req->common().ts_instance(),
         req->has_tablet_report() ? &req->tablet_report() : nullptr,
         l.epoch(),
-        resp->mutable_tablet_report(), &rpc);
+        resp->mutable_tablet_report(), &rpc, superseded);
     if (!process_tablet_report_result.ok()) {
       rpc.RespondFailure(
           process_tablet_report_result.status().CloneAndPrepend("Failed to process tablet report"));
@@ -707,7 +822,8 @@ Result<bool> MasterHeartbeatServiceImpl::ProcessTabletReport(
     const TabletReportPB* report_ptr,
     const LeaderEpoch& epoch,
     TabletReportUpdatesPB* report_update,
-    rpc::RpcContext* rpc) {
+    rpc::RpcContext* rpc,
+    const std::atomic<bool>& superseded) {
   if (!report_ptr) {
     return ts_desc->has_tablet_report();
   }
@@ -790,6 +906,12 @@ Result<bool> MasterHeartbeatServiceImpl::ProcessTabletReport(
 
     // 14. Check deadline. Need to exit before processing all batches if we're close to timing out.
     if (tablet_iter != reported_tablets.end()) {
+      // The tserver is no longer waiting for this response. Batches processed so far are
+      // committed, and the tserver re-reports tablets whose updates were not acknowledged.
+      if (superseded.load()) {
+        return STATUS(Aborted, TServerHeartbeatSlots::kSupersededMessage);
+      }
+
 
       // [TESTING] Inject latency before processing a batch to test deadline.
       if (PREDICT_FALSE(FLAGS_TEST_inject_latency_during_tablet_report_ms > 0)) {

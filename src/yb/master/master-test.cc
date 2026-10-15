@@ -31,6 +31,7 @@
 //
 
 #include <algorithm>
+#include <future>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -114,6 +115,7 @@ DECLARE_int32(db_history_retention_pin_max_txn_age_sec);
 DECLARE_int32(qos_max_db_count);
 DECLARE_int32(timestamp_syscatalog_history_retention_interval_sec);
 DECLARE_int32(tserver_unresponsive_timeout_ms);
+DECLARE_uint64(TEST_ts_heartbeat_processing_delay_ms);
 DECLARE_uint32(initial_tserver_registration_duration_secs);
 
 METRIC_DECLARE_gauge_uint64(block_cache_usage);
@@ -205,6 +207,50 @@ TEST_F(MasterTest, TestHeartbeatRequestWithEmptyUUID) {
   auto status = proxy_heartbeat_->TSHeartbeat(req, &resp, ResetAndGetController());
   ASSERT_FALSE(status.ok());
   ASSERT_STR_CONTAINS(status.message().ToBuffer(), "Recevied Empty UUID");
+}
+
+TEST_F(MasterTest, TestNewerHeartbeatSupersedesInFlightHeartbeats) {
+  ASSERT_RESULT(SendNewTSRegistrationHeartbeat("ts-1", 1));
+  ASSERT_RESULT(SendNewTSRegistrationHeartbeat("ts-2", 1));
+  auto universe_uuid =
+      ASSERT_RESULT(mini_master_->catalog_manager().GetClusterConfig()).universe_uuid();
+
+  auto send_heartbeat = [this, &universe_uuid](const std::string& uuid) {
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    req.mutable_common()->mutable_ts_instance()->set_permanent_uuid(uuid);
+    req.mutable_common()->mutable_ts_instance()->set_instance_seqno(1);
+    req.set_universe_uuid(universe_uuid);
+    rpc::RpcController controller;
+    controller.set_timeout(MonoDelta::FromSeconds(30));
+    auto status = proxy_heartbeat_->TSHeartbeat(req, &resp, &controller);
+    if (status.ok() && resp.has_error()) {
+      status = StatusFromPB(resp.error().status());
+    }
+    return status;
+  };
+  auto send_async = [&send_heartbeat](const std::string& uuid) {
+    return std::async(std::launch::async, send_heartbeat, uuid);
+  };
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_ts_heartbeat_processing_delay_ms) = 5000;
+  auto first = send_async("ts-1");
+  SleepFor(500ms);
+  auto other_ts = send_async("ts-2");
+  // Supersedes the first heartbeat, then is itself superseded by the third, whether it is still
+  // pending or already running when the third arrives.
+  auto second = send_async("ts-1");
+  SleepFor(500ms);
+  auto third = send_async("ts-1");
+
+  // The first heartbeat stops well before its 5s delay elapses.
+  ASSERT_EQ(first.wait_for(2s), std::future_status::ready);
+  auto first_status = first.get();
+  ASSERT_STR_CONTAINS(first_status.ToString(), "Superseded");
+  auto second_status = second.get();
+  ASSERT_STR_CONTAINS(second_status.ToString(), "Superseded");
+  ASSERT_OK(third.get());
+  ASSERT_OK(other_ts.get());
 }
 
 class MasterTestSkipUniverseUuidCheck : public MasterTest {
