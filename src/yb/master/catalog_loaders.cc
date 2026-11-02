@@ -32,6 +32,7 @@
 
 #include "yb/master/catalog_loaders.h"
 
+#include <string_view>
 #include <unordered_set>
 
 #include "yb/cdc/cdc_util.h"
@@ -263,23 +264,21 @@ Status TabletLoader::Visit(const TabletId& tablet_id, const SysTabletsEntryPB& m
       table_ids = state_->parent_to_child_tables[primary_table->id()];
       table_ids.push_back(primary_table->id());
     } else {
-      std::unordered_set<TableId> seen_table_ids;
+      std::unordered_set<std::string_view> seen_table_ids;
+      std::vector<std::string_view> repeated_table_ids;
       for (const auto& table_id : metadata.table_ids()) {
         if (seen_table_ids.insert(table_id).second) {
-          table_ids.push_back(table_id);
+          table_ids.emplace_back(table_id);
+        } else {
+          repeated_table_ids.push_back(table_id);
         }
       }
       // A retried creation of a ysql system table could list its id twice under the sys catalog
       // tablet, see github issue 34672. Drop the repeated ids from the persisted entry as well.
-      if (std::cmp_less(table_ids.size(), metadata.table_ids_size())) {
-        LOG(WARNING) << Format("Removing repeated table ids from the table_ids field of tablet $0: "
-            "$1. Sys catalog will be updated asynchronously.", tablet->id(),
-            AsString(metadata.table_ids()));
-        auto& pb = l.mutable_data()->pb;
-        pb.clear_table_ids();
-        for (const auto& table_id : table_ids) {
-          pb.add_table_ids(table_id);
-        }
+      if (!repeated_table_ids.empty()) {
+        LOG(WARNING) << Format("Removing repeated table ids $0 from the table_ids field of tablet "
+            "$1. Sys catalog will be updated asynchronously.", repeated_table_ids, tablet->id());
+        l.mutable_data()->pb.mutable_table_ids()->Assign(table_ids.begin(), table_ids.end());
         needs_async_write_to_sys_catalog = true;
       }
       // This is for backwards compatibility: we want to ensure that the table_ids
