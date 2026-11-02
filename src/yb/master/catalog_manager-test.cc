@@ -341,7 +341,11 @@ TEST(TestCatalogManager, CheckIfCanDeleteSingleTablet) {
 TEST(TableInfoTest, AddSameTabletTwice) {
   scoped_refptr<TableInfo> table(new TableInfo(CURRENT_TEST_NAME(), /* colocated */ false));
   auto tablet = ASSERT_RESULT(CreateTablet(table, "tablet", "" /* start_key */, "" /* end_key */));
-  ASSERT_OK(table->AddTablet(tablet));
+  {
+    // TabletLoader::Visit holds the tablet's write lock while adding it to its tables.
+    auto l = tablet->LockForWrite();
+    ASSERT_OK(table->AddTablet(tablet));
+  }
   ASSERT_EQ(table->TabletCount(), 1);
   ASSERT_EQ(table->NumPartitions(), 1);
   auto tablets = ASSERT_RESULT(table->GetTablets());
