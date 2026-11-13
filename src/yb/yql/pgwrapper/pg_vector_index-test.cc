@@ -94,6 +94,7 @@
 
 #include "yb/vector_index/vector_lsm_metadata.h"
 #include "yb/vector_index/distance.h"
+#include "yb/vector_index/hnsw_options.h"
 #include "yb/vector_index/usearch_include_wrapper_internal.h"
 #include "yb/vector_index/vector_lsm.h"
 
@@ -527,17 +528,13 @@ class PgVectorIndexTestBase : public PgMiniTestBase {
     return expected;
   }
 
-  unum::usearch::metric_kind_t UsearchMetricKind() const {
-    using vector_index::DistanceKind;
-    switch (distance_kind_) {
-      case DistanceKind::kL2Squared:
-        return unum::usearch::metric_kind_t::l2sq_k;
-      case DistanceKind::kInnerProduct:
-        return unum::usearch::metric_kind_t::ip_k;
-      case DistanceKind::kCosine:
-        return unum::usearch::metric_kind_t::cos_k;
-    }
-    FATAL_INVALID_ENUM_VALUE(DistanceKind, distance_kind_);
+  // The metric of the vector index, so that near ties are ordered the same way.
+  unum::usearch::metric_punned_t IndexMetric() const {
+    vector_index::HNSWOptions options {
+      .dimensions = dimensions_,
+      .distance_kind = distance_kind_,
+    };
+    return options.CreateMetric<FloatVector>();
   }
 
   template <class Vector>
@@ -778,8 +775,7 @@ Result<size_t> PgVectorIndexTestBase::FetchAndVerifyOrder(
   auto query = "SELECT id FROM test" + IndexQuerySuffix(query_vector, limit);
   auto result = VERIFY_RESULT(conn.FetchRows<int64_t>(query));
 
-  unum::usearch::metric_punned_t metric(
-      dimensions_, UsearchMetricKind(), unum::usearch::scalar_kind_t::f32_k);
+  auto metric = IndexMetric();
 
   std::vector<typename unum::usearch::metric_punned_t::result_t> distances;
   distances.reserve(result.size());
@@ -2641,8 +2637,7 @@ void PgVectorIndexTest::TestRandom() {
   real_dimensions_ = 16;
   dimensions_ = real_dimensions_ * kDimensionMultiplier;
 
-  unum::usearch::metric_punned_t metric(
-      dimensions_, UsearchMetricKind(), unum::usearch::scalar_kind_t::f32_k);
+  auto metric = IndexMetric();
 
   std::vector<const HdrHistogram*> read_histograms;
   for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {

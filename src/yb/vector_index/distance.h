@@ -117,26 +117,27 @@ inline auto DistanceInnerProduct(
 template<IndexableVectorType Vector>
 inline auto DistanceCosine(
     const Vector& a, const Vector& b) {
-  // Adapted from metric_cos_gt in index_plugins.hpp (usearch).
+  // Adapted from metric_cos_gt in index_plugins.hpp (usearch). Sums in double precision, where
+  // squares of float coordinates neither overflow nor underflow.
   using DistanceResult = typename DistanceTraits<Vector, DistanceKind::kCosine>::Result;
   CHECK_EQ(a.size(), b.size());
-  DistanceResult ab = 0;
-  DistanceResult a2 = 0;
-  DistanceResult b2 = 0;
+  double ab = 0;
+  double a2 = 0;
+  double b2 = 0;
   for (size_t i = 0; i < a.size(); ++i) {
-    DistanceResult ai = a[i];
-    DistanceResult bi = b[i];
+    double ai = a[i];
+    double bi = b[i];
     ab += ai * bi;
     a2 += ai * ai;
     b2 += bi * bi;
   }
 
-  DistanceResult result_if_zero[2][2];
+  double result_if_zero[2][2];
   result_if_zero[0][0] = 1 - ab / (std::sqrt(a2) * std::sqrt(b2));
   result_if_zero[0][1] = result_if_zero[1][0] = 1;
   result_if_zero[1][1] = 0;
 
-  return result_if_zero[a2 == 0][b2 == 0];
+  return static_cast<DistanceResult>(result_if_zero[a2 == 0][b2 == 0]);
 }
 
 }  // namespace distance

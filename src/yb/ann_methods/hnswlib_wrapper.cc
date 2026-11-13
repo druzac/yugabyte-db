@@ -86,13 +86,11 @@ class HnswlibVectorFilter : public hnswlib::BaseFilterFunctor<VectorId> {
   vector_index::VectorIdFilterAdapter adapter_;
 };
 
-template <vector_index::CoordinateScalarType CoordinateType, ValidDistanceResultType DistanceResult,
-          unum::usearch::metric_kind_t kMetricKind>
+template <vector_index::CoordinateScalarType CoordinateType, ValidDistanceResultType DistanceResult>
 class YbSpace : public hnswlib::SpaceInterface<DistanceResult> {
  public:
-  explicit YbSpace(size_t dim)
-      : metric_(dim, kMetricKind, unum::usearch::scalar_kind<CoordinateType>()),
-        data_size_(dim * sizeof(CoordinateType)) {
+  YbSpace(size_t dim, const unum::usearch::metric_punned_t& metric)
+      : metric_(metric), data_size_(dim * sizeof(CoordinateType)) {
   }
 
   size_t get_data_size() override {
@@ -140,13 +138,13 @@ Result<std::shared_ptr<hnswlib::SpaceInterface<DistanceResult>>> CreateSpace(
       if constexpr (std::is_same<CoordinateType, float>::value) {
         return std::make_shared<hnswlib::InnerProductSpace>(options.dimensions);
       } else {
-        return std::make_shared<YbSpace<
-            CoordinateType, DistanceResult, unum::usearch::metric_kind_t::ip_k>>(
-                options.dimensions);
+        return std::make_shared<YbSpace<CoordinateType, DistanceResult>>(
+            options.dimensions, options.CreateMetric<std::vector<CoordinateType>>());
       }
     case DistanceKind::kCosine:
-      return std::make_shared<YbSpace<
-          CoordinateType, DistanceResult, unum::usearch::metric_kind_t::cos_k>>(options.dimensions);
+      // The metric of the YbHnsw chunks this index is saved to, see HNSWOptions::CreateMetric.
+      return std::make_shared<YbSpace<CoordinateType, DistanceResult>>(
+          options.dimensions, options.CreateMetric<std::vector<CoordinateType>>());
   }
 
   return STATUS_FORMAT(
