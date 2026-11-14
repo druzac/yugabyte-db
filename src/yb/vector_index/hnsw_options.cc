@@ -75,14 +75,17 @@ float CosineDistance(const float* lhs, const float* rhs, size_t dimensions) {
       lane_b2[lane] += r * r;
     }
   }
-  float ab = 0;
-  float a2 = 0;
-  float b2 = 0;
-  for (size_t lane = 0; lane != kLanes; ++lane) {
-    ab += lane_ab[lane];
-    a2 += lane_a2[lane];
-    b2 += lane_b2[lane];
+  // Pairwise, so that a sum takes log2(kLanes) dependent additions instead of kLanes.
+  for (size_t width = kLanes / 2; width != 0; width /= 2) {
+    for (size_t lane = 0; lane != width; ++lane) {
+      lane_ab[lane] += lane_ab[lane + width];
+      lane_a2[lane] += lane_a2[lane + width];
+      lane_b2[lane] += lane_b2[lane + width];
+    }
   }
+  float ab = lane_ab[0];
+  float a2 = lane_a2[0];
+  float b2 = lane_b2[0];
   for (; i != dimensions; ++i) {
     ab += lhs[i] * rhs[i];
     a2 += lhs[i] * lhs[i];

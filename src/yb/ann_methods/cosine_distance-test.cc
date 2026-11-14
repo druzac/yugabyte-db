@@ -49,6 +49,11 @@ using vector_index::VectorIndexTraitsPtr;
 // The squared norm of a vector with coordinates of these magnitudes underflows or overflows float.
 constexpr float kExtremeScales[] = {1e-40f, 1e-23f, 1e20f, 1e30f};
 
+// Depending on the number of dimensions, the squared norm of a vector with coordinates of these
+// magnitudes is on either side of the bounds of the range where the metric sums in single
+// precision.
+constexpr float kBoundaryScales[] = {1e-13f, 1e-12f, 1e17f, 1e18f};
+
 class CosineDistanceTest : public hnsw::VectorIndexTestBase {
  protected:
   FloatVector GaussianVector(size_t dimensions, float scale = 1) {
@@ -73,6 +78,7 @@ class CosineDistanceTest : public hnsw::VectorIndexTestBase {
 TEST_F(CosineDistanceTest, Magnitudes) {
   std::vector<float> scales = {1};
   scales.insert(scales.end(), std::begin(kExtremeScales), std::end(kExtremeScales));
+  scales.insert(scales.end(), std::begin(kBoundaryScales), std::end(kBoundaryScales));
   // With and without coordinates left after the lanes of the single precision sums.
   constexpr size_t kDimensions[] = {1, 3, 16, 37, 100};
   for (auto dimensions : kDimensions) {
@@ -95,6 +101,31 @@ TEST_F(CosineDistanceTest, Magnitudes) {
       }
     }
   }
+}
+
+// Products of some coordinates underflow, while the squared norms stay in the single precision
+// range.
+TEST_F(CosineDistanceTest, UnderflowingCoordinates) {
+  constexpr size_t kDimensions = 37;
+  HNSWOptions options {
+    .dimensions = kDimensions,
+    .distance_kind = DistanceKind::kCosine,
+  };
+  auto metric = options.CreateMetric<FloatVector>();
+  for (int i = 0; i != 100; ++i) {
+    auto lhs = GaussianVector(kDimensions);
+    auto rhs = GaussianVector(kDimensions);
+    for (size_t j = 0; j < kDimensions; j += 2) {
+      lhs[j] *= 1e-30f;
+      rhs[j] *= 1e-40f;
+    }
+    ASSERT_NEAR(Distance(metric, lhs, rhs), vector_index::distance::DistanceCosine(lhs, rhs), 1e-5)
+        << "lhs: " << AsString(lhs) << ", rhs: " << AsString(rhs);
+  }
+  // One vector in the single precision range and one outside of it.
+  FloatVector lhs = {1, 1e-30f};
+  FloatVector rhs = {1e-20f, 1e-30f};
+  ASSERT_NEAR(Distance(metric, lhs, rhs), 0, 1e-6);
 }
 
 TEST_F(CosineDistanceTest, ExtremeMagnitudeDirections) {

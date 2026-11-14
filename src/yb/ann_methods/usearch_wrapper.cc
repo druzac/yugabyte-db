@@ -177,8 +177,11 @@ class UsearchIndex :
       num_members, max_concurrent_inserts + max_concurrent_reads));
     search_semaphore_.emplace(max_concurrent_reads);
     static std::once_flag log_once;
-    std::call_once(log_once, [index = &index_]() {
-      LOG(INFO) << "Usearch metric: " << index->metric().isa_name();
+    std::call_once(log_once, [index = &index_, distance_kind = distance_kind_]() {
+      // Usearch reports the cosine kernel of HNSWOptions::CreateMetric as serial.
+      LOG(INFO) << "Usearch metric: "
+                << (distance_kind == DistanceKind::kCosine
+                        ? "YB cosine kernel" : index->metric().isa_name());
     });
     return Status::OK();
   }
