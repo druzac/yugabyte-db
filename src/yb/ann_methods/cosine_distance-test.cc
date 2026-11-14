@@ -122,10 +122,6 @@ TEST_F(CosineDistanceTest, UnderflowingCoordinates) {
     ASSERT_NEAR(Distance(metric, lhs, rhs), vector_index::distance::DistanceCosine(lhs, rhs), 1e-5)
         << "lhs: " << AsString(lhs) << ", rhs: " << AsString(rhs);
   }
-  // One vector in the single precision range and one outside of it.
-  FloatVector lhs = {1, 1e-30f};
-  FloatVector rhs = {1e-20f, 1e-30f};
-  ASSERT_NEAR(Distance(metric, lhs, rhs), 0, 1e-6);
 }
 
 TEST_F(CosineDistanceTest, ExtremeMagnitudeDirections) {
@@ -149,6 +145,8 @@ TEST_F(CosineDistanceTest, ExtremeMagnitudeDirections) {
     ASSERT_NEAR(distance(x, {1, 0}), 0, 1e-6) << scale;
     ASSERT_NEAR(distance({0, 1}, x), 1, 1e-6) << scale;
   }
+  // One vector in the single precision range and one outside of it.
+  ASSERT_NEAR(distance({1, 1e-30f}, {1e-20f, 1e-30f}), 0, 1e-6);
   // Zero vectors are at distance 0 from each other and 1 from other vectors, as in usearch.
   ASSERT_EQ(distance({0, 0}, {0, 0}), 0.0f);
   ASSERT_EQ(distance({0, 0}, {1, 2}), 1.0f);
