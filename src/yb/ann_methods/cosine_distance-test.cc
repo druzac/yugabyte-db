@@ -103,6 +103,34 @@ TEST_F(CosineDistanceTest, Magnitudes) {
   }
 }
 
+// The copies of the kernel for the instruction sets of this host return the same distances, so a
+// distance does not depend on the host that computes it.
+TEST_F(CosineDistanceTest, InstructionSetsAgree) {
+  std::vector<float> scales = {1};
+  scales.insert(scales.end(), std::begin(kExtremeScales), std::end(kExtremeScales));
+  scales.insert(scales.end(), std::begin(kBoundaryScales), std::end(kBoundaryScales));
+  constexpr size_t kDimensions[] = {1, 3, 16, 37, 100, 768};
+  for (auto dimensions : kDimensions) {
+    auto metrics = vector_index::TEST_CosineMetrics(dimensions);
+    std::vector<const char*> instruction_sets;
+    for (const auto& [instruction_set, metric] : metrics) {
+      instruction_sets.push_back(instruction_set);
+    }
+    LOG(INFO) << "Instruction sets: " << AsString(instruction_sets);
+    for (auto lhs_scale : scales) {
+      for (auto rhs_scale : scales) {
+        auto lhs = GaussianVector(dimensions, lhs_scale);
+        auto rhs = GaussianVector(dimensions, rhs_scale);
+        auto expected = Distance(metrics.front().second, lhs, rhs);
+        for (const auto& [instruction_set, metric] : metrics) {
+          ASSERT_EQ(Distance(metric, lhs, rhs), expected)
+              << instruction_set << ", lhs: " << AsString(lhs) << ", rhs: " << AsString(rhs);
+        }
+      }
+    }
+  }
+}
+
 // Products of some coordinates underflow, while the squared norms stay in the single precision
 // range.
 TEST_F(CosineDistanceTest, UnderflowingCoordinates) {

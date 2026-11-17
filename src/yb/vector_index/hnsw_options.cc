@@ -15,6 +15,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <utility>
+#include <vector>
 
 #include <boost/preprocessor/seq/for_each.hpp>
 
@@ -58,7 +61,16 @@ float CosineDistanceFromSums(double ab, double a2, double b2) {
 // 1.8e19 overflows. The infinite or NaN distances such a vector gets then break the HNSW graph for
 // every other vector too (#37160). This kernel falls back to double precision for such vectors,
 // which holds the product of any two floats exactly.
-float CosineDistance(const float* lhs, const float* rhs, size_t dimensions) {
+//
+// It is inlined into a copy for each instruction set, see SupportedCosineKernels. Every copy adds
+// the same products in the same order, so all of them return the same distances.
+ATTRIBUTE_ALWAYS_INLINE inline float CosineDistance(
+    const float* lhs, const float* rhs, size_t dimensions) {
+#if defined(__clang__)
+  // A fused multiply-add rounds once instead of twice, so the AVX-512 copy, the only one that has
+  // FMA, would return different distances.
+#pragma clang fp contract(off)
+#endif
   // A sum per lane lets the compiler vectorize the loop without reordering floating point
   // additions, which it would not do for a single sum.
   constexpr size_t kLanes = 16;
@@ -109,10 +121,64 @@ float CosineDistance(const float* lhs, const float* rhs, size_t dimensions) {
 }
 
 // CosineDistance with the metric_punned_signature_t::array_array_size_k signature.
+using PunnedDistanceFunction = unum::usearch::distance_punned_t (*)(size_t, size_t, size_t);
+
 unum::usearch::distance_punned_t PunnedCosineDistance(
     size_t lhs, size_t rhs, size_t dimensions) {
   return CosineDistance(
       reinterpret_cast<const float*>(lhs), reinterpret_cast<const float*>(rhs), dimensions);
+}
+
+// The build targets SSE4.2 on x86, these copies use the wider vectors of newer CPUs. Only clang
+// builds have them, since only clang turns off FMA contraction with the pragma in CosineDistance.
+#if defined(__clang__) && defined(__x86_64__)
+#define YB_HAVE_X86_COSINE_KERNELS 1
+
+__attribute__((target("avx2")))
+unum::usearch::distance_punned_t PunnedCosineDistanceAvx2(
+    size_t lhs, size_t rhs, size_t dimensions) {
+  return CosineDistance(
+      reinterpret_cast<const float*>(lhs), reinterpret_cast<const float*>(rhs), dimensions);
+}
+
+__attribute__((target("avx512f")))
+unum::usearch::distance_punned_t PunnedCosineDistanceAvx512(
+    size_t lhs, size_t rhs, size_t dimensions) {
+  return CosineDistance(
+      reinterpret_cast<const float*>(lhs), reinterpret_cast<const float*>(rhs), dimensions);
+}
+#endif
+
+struct CosineKernel {
+  const char* instruction_set;
+  PunnedDistanceFunction function;
+};
+
+// The copies of the cosine kernel that this host can run, the best one last.
+std::vector<CosineKernel> SupportedCosineKernels() {
+  std::vector<CosineKernel> result = {{"baseline", &PunnedCosineDistance}};
+#if defined(YB_HAVE_X86_COSINE_KERNELS)
+  __builtin_cpu_init();
+  if (__builtin_cpu_supports("avx2")) {
+    result.push_back({"avx2", &PunnedCosineDistanceAvx2});
+  }
+  if (__builtin_cpu_supports("avx512f")) {
+    result.push_back({"avx512f", &PunnedCosineDistanceAvx512});
+  }
+#endif
+  return result;
+}
+
+const CosineKernel& HostCosineKernel() {
+  static const auto kernel = SupportedCosineKernels().back();
+  return kernel;
+}
+
+unum::usearch::metric_punned_t CosineMetric(size_t dimensions, PunnedDistanceFunction function) {
+  return unum::usearch::metric_punned_t::stateless(
+      dimensions, reinterpret_cast<std::uintptr_t>(function),
+      unum::usearch::metric_punned_signature_t::array_array_size_k, metric_kind_t::cos_k,
+      scalar_kind_t::f32_k);
 }
 
 metric_kind_t MetricKindFromDistanceType(DistanceKind distance_kind) {
@@ -157,10 +223,7 @@ template <class Vector>
 unum::usearch::metric_punned_t HNSWOptions::CreateMetric() const {
   if constexpr (std::is_same_v<typename Vector::value_type, float>) {
     if (distance_kind == DistanceKind::kCosine) {
-      return unum::usearch::metric_punned_t::stateless(
-          dimensions, reinterpret_cast<std::uintptr_t>(&PunnedCosineDistance),
-          unum::usearch::metric_punned_signature_t::array_array_size_k, metric_kind_t::cos_k,
-          scalar_kind_t::f32_k);
+      return CosineMetric(dimensions, HostCosineKernel().function);
     }
   }
   return unum::usearch::metric_punned_t(
@@ -171,5 +234,18 @@ unum::usearch::metric_punned_t HNSWOptions::CreateMetric() const {
 
 template
 unum::usearch::metric_punned_t HNSWOptions::CreateMetric<FloatVector>() const;
+
+const char* CosineKernelInstructionSet() {
+  return HostCosineKernel().instruction_set;
+}
+
+std::vector<std::pair<const char*, unum::usearch::metric_punned_t>> TEST_CosineMetrics(
+    size_t dimensions) {
+  std::vector<std::pair<const char*, unum::usearch::metric_punned_t>> result;
+  for (const auto& kernel : SupportedCosineKernels()) {
+    result.emplace_back(kernel.instruction_set, CosineMetric(dimensions, kernel.function));
+  }
+  return result;
+}
 
 }  // namespace yb::vector_index

@@ -16,6 +16,8 @@
 #include <cstddef>
 
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "yb/vector_index/distance.h"
 
@@ -65,5 +67,13 @@ struct HNSWOptions {
   template <class Vector>
   unum::usearch::metric_punned_t CreateMetric() const;
 };
+
+// The instruction set of the copy of the float cosine kernel that CreateMetric uses on this host.
+const char* CosineKernelInstructionSet();
+
+// Metrics for the copies of the float cosine kernel that this host can run, with their instruction
+// sets. The one CreateMetric uses is last.
+std::vector<std::pair<const char*, unum::usearch::metric_punned_t>> TEST_CosineMetrics(
+    size_t dimensions);
 
 }  // namespace yb::vector_index

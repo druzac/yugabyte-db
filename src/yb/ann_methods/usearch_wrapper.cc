@@ -179,9 +179,12 @@ class UsearchIndex :
     static std::once_flag log_once;
     std::call_once(log_once, [index = &index_, distance_kind = distance_kind_]() {
       // Usearch reports the cosine kernel of HNSWOptions::CreateMetric as serial.
-      LOG(INFO) << "Usearch metric: "
-                << (distance_kind == DistanceKind::kCosine
-                        ? "YB cosine kernel" : index->metric().isa_name());
+      if (distance_kind == DistanceKind::kCosine) {
+        LOG(INFO) << "Usearch metric: YB cosine kernel, "
+                  << vector_index::CosineKernelInstructionSet();
+      } else {
+        LOG(INFO) << "Usearch metric: " << index->metric().isa_name();
+      }
     });
     return Status::OK();
   }

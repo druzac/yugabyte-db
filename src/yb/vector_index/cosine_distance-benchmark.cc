@@ -11,21 +11,26 @@
 // under the License.
 //
 
-// Compares the cosine metric of HNSWOptions::CreateMetric with the one usearch builds by itself,
-// which dispatches to SimSIMD and which vector indexes used before #37160.
+// Compares the copies of the cosine kernel of HNSWOptions::CreateMetric that this host can run with
+// the cosine metric usearch builds by itself, which dispatches to SimSIMD and which vector indexes
+// used before #37160.
 
 #include <benchmark/benchmark.h>
 
 #include <map>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "yb/gutil/casts.h"
 
+#include "yb/util/benchmark_main.h"
+
 #include "yb/vector_index/hnsw_options.h"
 #include "yb/vector_index/usearch_include_wrapper_internal.h"
 
-namespace yb::vector_index {
+namespace yb {
+namespace vector_index {
 namespace {
 
 // Few enough vectors to stay in cache, so that the benchmark measures the kernels.
@@ -73,14 +78,20 @@ void BM_CosineUsearchBuiltin(benchmark::State& state) {
 }
 BENCHMARK(BM_CosineUsearchBuiltin)->Apply(Dimensions);
 
-void BM_CosineCreateMetric(benchmark::State& state) {
-  HNSWOptions options {
-    .dimensions = static_cast<size_t>(state.range(0)),
-    .distance_kind = DistanceKind::kCosine,
-  };
-  Run(state, options.CreateMetric<FloatVector>());
-}
-BENCHMARK(BM_CosineCreateMetric)->Apply(Dimensions);
-
 } // namespace
-} // namespace yb::vector_index
+} // namespace vector_index
+
+bool BenchmarkInit(int argc, char** argv) {
+  auto kernels = vector_index::TEST_CosineMetrics(/* dimensions= */ 1);
+  for (size_t kernel = 0; kernel != kernels.size(); ++kernel) {
+    benchmark::RegisterBenchmark(
+        std::string("BM_CosineYb/") + kernels[kernel].first,
+        [kernel](benchmark::State& state) {
+          vector_index::Run(state, vector_index::TEST_CosineMetrics(
+              static_cast<size_t>(state.range(0)))[kernel].second);
+        })->Apply(vector_index::Dimensions);
+  }
+  return DefaultBenchmarkInit(argc, argv);
+}
+
+} // namespace yb
