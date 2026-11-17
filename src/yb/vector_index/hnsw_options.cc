@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -47,6 +48,24 @@ bool SinglePrecisionIsAccurate(float squared_norm) {
          squared_norm <= kMaxSinglePrecisionSquaredNorm;
 }
 
+// A sum per lane, so that the loops of CosineDistance add every product in order and still use
+// vector instructions: 4 SSE, 2 AVX or 1 AVX-512 register per vector of lanes.
+using Lanes = float __attribute__((vector_size(64)));
+
+// Adds the lanes pairwise, so that a sum takes 4 dependent additions instead of 16, in an order
+// that is the same in every copy of the kernel.
+ATTRIBUTE_ALWAYS_INLINE inline float SumLanes(const Lanes& lanes) {
+  float s0 = lanes[0] + lanes[8];
+  float s1 = lanes[1] + lanes[9];
+  float s2 = lanes[2] + lanes[10];
+  float s3 = lanes[3] + lanes[11];
+  float s4 = lanes[4] + lanes[12];
+  float s5 = lanes[5] + lanes[13];
+  float s6 = lanes[6] + lanes[14];
+  float s7 = lanes[7] + lanes[15];
+  return ((s0 + s4) + (s2 + s6)) + ((s1 + s5) + (s3 + s7));
+}
+
 float CosineDistanceFromSums(double ab, double a2, double b2) {
   // Same as usearch: zero vectors are at distance 0 from each other and 1 from other vectors.
   if (a2 == 0 || b2 == 0) {
@@ -71,40 +90,32 @@ ATTRIBUTE_ALWAYS_INLINE inline float CosineDistance(
   // FMA, would return different distances.
 #pragma clang fp contract(off)
 #endif
-  // A sum per lane lets the compiler vectorize the loop without reordering floating point
-  // additions, which it would not do for a single sum.
-  constexpr size_t kLanes = 16;
-  float lane_ab[kLanes] = {};
-  float lane_a2[kLanes] = {};
-  float lane_b2[kLanes] = {};
+  constexpr size_t kLanes = sizeof(Lanes) / sizeof(float);
+  Lanes lane_ab = {};
+  Lanes lane_a2 = {};
+  Lanes lane_b2 = {};
   size_t i = 0;
   for (; i + kLanes <= dimensions; i += kLanes) {
-    for (size_t lane = 0; lane != kLanes; ++lane) {
-      float l = lhs[i + lane];
-      float r = rhs[i + lane];
-      lane_ab[lane] += l * r;
-      lane_a2[lane] += l * l;
-      lane_b2[lane] += r * r;
-    }
+    Lanes l;
+    Lanes r;
+    std::memcpy(&l, lhs + i, sizeof(l));
+    std::memcpy(&r, rhs + i, sizeof(r));
+    lane_ab += l * r;
+    lane_a2 += l * l;
+    lane_b2 += r * r;
   }
-  // Pairwise, so that a sum takes log2(kLanes) dependent additions instead of kLanes.
-  for (size_t width = kLanes / 2; width != 0; width /= 2) {
-    for (size_t lane = 0; lane != width; ++lane) {
-      lane_ab[lane] += lane_ab[lane + width];
-      lane_a2[lane] += lane_a2[lane + width];
-      lane_b2[lane] += lane_b2[lane + width];
-    }
-  }
-  float ab = lane_ab[0];
-  float a2 = lane_a2[0];
-  float b2 = lane_b2[0];
+  float ab = SumLanes(lane_ab);
+  float a2 = SumLanes(lane_a2);
+  float b2 = SumLanes(lane_b2);
   for (; i != dimensions; ++i) {
     ab += lhs[i] * rhs[i];
     a2 += lhs[i] * lhs[i];
     b2 += rhs[i] * rhs[i];
   }
   if (PREDICT_TRUE(SinglePrecisionIsAccurate(a2) && SinglePrecisionIsAccurate(b2))) {
-    return CosineDistanceFromSums(ab, a2, b2);
+    // The square roots are at most 2^60 and their product at most 2^120, so single precision is
+    // enough here too.
+    return 1 - std::clamp(ab / (std::sqrt(a2) * std::sqrt(b2)), -1.0f, 1.0f);
   }
 
   double ab_exact = 0;
@@ -134,7 +145,9 @@ unum::usearch::distance_punned_t PunnedCosineDistance(
 #if defined(__clang__) && defined(__x86_64__)
 #define YB_HAVE_X86_COSINE_KERNELS 1
 
-__attribute__((target("avx2")))
+// Tuned for Haswell, the first CPU with AVX2, since the Ivy Bridge tuning of the build splits every
+// 256-bit load in two.
+__attribute__((target("avx2,tune=haswell")))
 unum::usearch::distance_punned_t PunnedCosineDistanceAvx2(
     size_t lhs, size_t rhs, size_t dimensions) {
   return CosineDistance(
