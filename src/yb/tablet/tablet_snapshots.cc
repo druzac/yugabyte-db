@@ -759,6 +759,20 @@ Result<docdb::CotableIdsMap> TabletSnapshots::GetCotableIdsMap(const std::string
   return cotable_ids_map;
 }
 
+namespace {
+
+bool HasHybridTimeFilter(rocksdb::DB& db) {
+  for (const auto& file : db.GetLiveFilesMetaData()) {
+    if (file.largest.user_frontier &&
+        down_cast<const docdb::ConsensusFrontier&>(*file.largest.user_frontier).HasFilter()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+} // namespace
+
 Status TabletSnapshots::RestoreCheckpoint(
     const std::string& snapshot_dir, HybridTime restore_at, const RestoreMetadata& restore_metadata,
     const docdb::ConsensusFrontier& frontier, bool is_pitr_restore, const OpId& op_id) {
@@ -948,6 +962,19 @@ Status TabletSnapshots::RestoreCheckpoint(
 
   // Schedule post split compaction after compaction enabled on the tablet.
   tablet().TriggerPostSplitCompactionIfNeeded();
+
+  // A restore to a time keeps the files written after it behind a hybrid time filter. Until a
+  // compaction drops the filtered out entries, a read steps over them one at a time, and a vector
+  // index search does so for each candidate. A full compaction that is already running covers them.
+  // The vector indexes keep the rolled back vectors until their own compactions, but checking one
+  // costs a single lookup then.
+  if (HasHybridTimeFilter(*tablet().regular_db())) {
+    s = tablet().TriggerManualCompactionIfNeeded(
+        rocksdb::CompactionReason::kScheduledFullCompaction, IncludeVectorIndexes::kFalse);
+    if (!s.ok() && !s.IsServiceUnavailable()) {
+      LOG_WITH_PREFIX(WARNING) << "Failed to submit compaction after restore: " << s;
+    }
+  }
 
   return Status::OK();
 }
